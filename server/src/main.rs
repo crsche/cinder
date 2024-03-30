@@ -30,7 +30,7 @@ struct Ports {
 }
 
 const PORTS: Ports = Ports {
-    http: 8080,
+    http: 4343,
     https: 8080,
 };
 
@@ -38,9 +38,10 @@ const CERT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/certs/cert.pem");
 const KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/certs/key.pem");
 
 const STATIC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
+const DIST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../client/dist");
 
-async fn hello() -> &'static str {
-    "Hello, World!"
+async fn ping() -> &'static str {
+    "pong!"
 }
 
 #[tokio::main]
@@ -60,15 +61,21 @@ async fn main() -> Result<()> {
     let static_ = ServeDir::new(STATIC)
         .precompressed_br()
         .precompressed_zstd()
-        .precompressed_gzip().precompressed_deflate();
+        .precompressed_gzip()
+        .precompressed_deflate();
     debug!(?static_, "serving static files");
 
+    let api = Router::new().route("/ping", get(ping));
+
+    let dist = ServeDir::new(DIST);
+
     let app = Router::new()
+        .nest_service("/", dist)
         .nest_service("/static", static_)
-        .route("/", get(hello))
+        .nest("/api", api)
+        .fallback(handler_404)
         .layer(TraceLayer::new_for_http())
-        .layer(compression)
-        .fallback(handler_404);
+        .layer(compression);
 
     let mut listenfd = ListenFd::from_env();
     let listener = match listenfd.take_tcp_listener(0)? {
