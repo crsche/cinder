@@ -57,7 +57,10 @@ async fn main() -> Result<()> {
         .zstd(true);
     debug!("compression enabled");
 
-    let static_ = ServeDir::new(STATIC);
+    let static_ = ServeDir::new(STATIC)
+        .precompressed_br()
+        .precompressed_zstd()
+        .precompressed_gzip().precompressed_deflate();
     debug!(?static_, "serving static files");
 
     let app = Router::new()
