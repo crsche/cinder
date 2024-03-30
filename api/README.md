@@ -14,7 +14,7 @@ $ cargo install cargo-watch systemfd
 $ RUST_LOG=debug systemfd --no-pid -s https::8080 -- cargo watch -x ru
 ```
 
-Note that changing the port above will cause errors with redirection from HTTP to HTTPs 
+Note that changing the port above to anything other than `8080` will cause errors with redirection from HTTP to HTTPS (it has to agree with `main.rs`)
 
 ## To Run
 
@@ -26,4 +26,6 @@ Go to [localhost:8080](https://localhost:8080) to see it in action.
 
 ## Feature Set
 
-- Compression - `br`, `zstd`, `deflate`
+- Precompressed GeoJSON data - `br`, `zstd`, `deflate`, `gzip`
+- General compression
+
