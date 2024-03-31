@@ -160,7 +160,7 @@ Don't forget to give the project a star! Thanks again!
 <!-- LICENSE -->
 ## License
 
-Distributed under the Apache 2.0 License. See `LICENSE.txt` for more information.
+Distributed under the Apache 2.0 License. See `LICENSE` for more information.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -201,7 +201,7 @@ Project Link: [https://github.com/crsche/cinder](https://github.com/crsche/cinde
 [issues-shield]: https://img.shields.io/github/issues/crsche/cinder.svg?style=for-the-badge
 [issues-url]: https://github.com/crsche/cinder/issues
 [license-shield]: https://img.shields.io/github/license/crsche/cinder.svg?style=for-the-badge
-[license-url]: https://github.com/crsche/cinder/blob/master/LICENSE.txt
+[license-url]: https://github.com/crsche/cinder/blob/master/LICENSE
 [linkedin-shield]: https://img.shields.io/badge/-LinkedIn-black.svg?style=for-the-badge&logo=linkedin&colorB=555
 [linkedin-url]: https://linkedin.com/in/linkedin_username
 [product-screenshot]: images/screenshot.png
