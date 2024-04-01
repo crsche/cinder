@@ -1,34 +1,52 @@
+"use client";
+
+import * as React from "react";
 import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import viteLogo from "/vite.svg";
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Sheet,
+  SheetClose,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+} from "@/components/ui/sheet";
+import { ThemeProvider } from "@/components/theme-provider";
+import { SendHorizonal } from "lucide-react";
+
+import "../app/globals.css";
 import "./App.css";
+import { ModeToggle } from "./components/mode-toggle";
 
 function App() {
-  const [count, setCount] = useState(0);
+  // const [isOpen, setIsOpen] = React.useState(false);
 
   return (
-    <>
-      <div>
-        <a href="https://vitejs.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count} chat what the fuck!1!!!! reactivity!!!!!???
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
+    <ThemeProvider defaultTheme="dark" storageKey="vite-ui-theme">
+      {/* <ModeToggle/> */}
+
+      <Sheet open={true} modal={false}>
+        <SheetContent side={"left"}>
+          <SheetHeader>
+            <SheetTitle>Search for Colleges</SheetTitle>
+            <SheetDescription>With SQL</SheetDescription>
+          </SheetHeader>
+          <div className="grid gap-4 py-4">
+            <div className="grid grid-cols-4 items-center gap-4">
+              <Input id="query" placeholder="SQL Query" className="col-span-3" autoComplete="off"/>
+              <Button type="submit">
+                <SendHorizonal className="h-4 w-4"/>
+              </Button>
+            </div>
+          </div>
+        </SheetContent>
+      </Sheet>
+    </ThemeProvider>
   );
 }
 
