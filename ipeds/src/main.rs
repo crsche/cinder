@@ -1,7 +1,10 @@
 #![feature(let_chains, generic_arg_infer, exit_status_error)]
 #[macro_use]
 extern crate tracing;
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{anyhow, bail, Result};
 use async_zip::base::read::stream::ZipFileReader;
@@ -50,7 +53,12 @@ struct Args {
 
 async fn get_mdb_convert(url: Url, out_dir: PathBuf, db: Pool, client: Client) -> Result<()> {
     // TODO: Make the path conversion/sanatization less cluttered
-    info!("downloading {} to `{}`", url.as_ref(), out_dir.display());
+    let name = url
+        .path_segments()
+        .ok_or(anyhow!("`{}`: no path segments found", url.as_ref()))?
+        .last()
+        .ok_or(anyhow!("`{}`: no last path segment found", url.as_ref()))?;
+    info!("`{}`->`{}` - START", name, out_dir.display());
     let resp = client.get(url.clone()).send().await?.error_for_status()?;
 
     let stream = resp
@@ -71,7 +79,7 @@ async fn get_mdb_convert(url: Url, out_dir: PathBuf, db: Pool, client: Client) -
                 // Nested folders are not supported
                 let filename = raw_path
                     .file_name()
-                    .ok_or(anyhow!("{}: no file name found", raw_name))?;
+                    .ok_or(anyhow!("`{}`: no file name found", raw_name))?;
                 let filepath = out_dir.join(filename);
                 let f = OpenOptions::new()
                     // .truncate(true)
@@ -83,9 +91,9 @@ async fn get_mdb_convert(url: Url, out_dir: PathBuf, db: Pool, client: Client) -
                 let mut compat_rdr = rdr.compat();
                 let bytes = io::copy(&mut compat_rdr, &mut wrtr).await?;
                 info!(
-                    "wrote {} to `{}`",
+                    "`{}` - {} bytes written",
+                    filename.to_string_lossy(),
                     human_bytes(bytes as f64),
-                    filepath.display()
                 );
 
                 if let Some(ext) = filepath.extension()
@@ -96,7 +104,7 @@ async fn get_mdb_convert(url: Url, out_dir: PathBuf, db: Pool, client: Client) -
                         // rest of the archrive
                         convert_handle = Some(tokio::spawn(convert_mdb(filepath, db.clone())));
                     } else {
-                        bail!("multiple MDB files found in `{}`", url.as_ref());
+                        bail!("`{}`: multiple MDB files found", url.as_ref());
                     }
                 }
             }
@@ -105,6 +113,7 @@ async fn get_mdb_convert(url: Url, out_dir: PathBuf, db: Pool, client: Client) -
             break;
         }
     }
+    info!("`{}`->`{}` - DONE", name, out_dir.display());
     if let Some(handle) = convert_handle {
         handle.await??;
     }
@@ -121,64 +130,60 @@ fn check_tools(tools: &[&str]) -> Result<()> {
 }
 
 async fn convert_mdb(mdb_in: PathBuf, db: Pool) -> Result<()> {
-    info!("converting `{}` to SQL", mdb_in.display());
+    let filename = mdb_in.file_name().unwrap().to_str().unwrap().to_string();
+    info!("`{}`->SQL - START", filename);
     // Get schema with mdb-schema
     let mut get_schema = Command::new("mdb-schema");
     get_schema
         .args(&["--drop-table", "--no-relations"])
         .arg(&mdb_in)
         .arg("postgres");
-    let schema_handle = get_schema.output();
+    let raw_schema = get_schema.output().await?.stdout;
+    let schema_sql = std::str::from_utf8(&raw_schema)?;
+    let conn = db.get().await?;
+    conn.batch_execute(schema_sql).await?;
+    drop(conn);
 
     // Get tables with mdb-tables. TODO: Make this less verbose?
     let mut get_tables = Command::new("mdb-tables");
     get_tables.arg("-1").arg(&mdb_in);
-    let tables_handle = get_tables.output();
-    let tables_output = tables_handle.await?;
-    tables_output.status.exit_ok()?;
-    let stdout = String::from_utf8(tables_output.stdout)?;
-    let tables = stdout.split_whitespace();
+    let raw_tables = get_tables.output().await?.stdout.clone();
+    let tables = std::str::from_utf8(&raw_tables)?;
 
     // Spawn tasks for exporting the tables with mdb-export
+    let mdb_in = Arc::new(mdb_in);
+    let filename = Arc::new(filename);
     let export_handles = tables
-        .map(|table| -> Result<_> {
+        .lines()
+        .map(|table| {
             // Export each table with mdbtools (doesn't support exporting everything)
-            let mut export = Command::new("mdb-export");
-            export
-                .arg("-H")
-                .arg("-D")
-                .arg("%Y-%m-%d %H:%M:%S")
-                .args(&["-I", "postgres"])
-                .arg(&mdb_in)
-                .arg(&table);
-            Ok(export.output())
+            let db = db.clone();
+            let mdb_in = mdb_in.clone();
+            let filename = filename.clone();
+            let table = table.to_owned();
+            tokio::spawn(async move {
+                let mut export = Command::new("mdb-export");
+                export
+                    .arg("-H")
+                    .arg("-D")
+                    .arg("%Y-%m-%d %H:%M:%S")
+                    .args(&["-I", "postgres"])
+                    .arg(mdb_in.as_ref()) // Pass the reference to OsStr
+                    .arg(&table);
+                let raw_export = export.output().await?.stdout;
+                let sql = std::str::from_utf8(&raw_export)?;
+                let conn = db.get().await?;
+                conn.batch_execute(sql).await?;
+                debug!("`{}` / `{}` --> SQL", filename, table);
+                drop(conn);
+                anyhow::Ok(())
+            })
         })
         .collect::<Vec<_>>();
-
-    // Begin creating a transaction string from all of the mdbtools outputs
-    let mut transaction = String::from("BEGIN;").into_bytes(); // We use bytes here for performance
-
-    let schema_res = schema_handle.await?;
-    schema_res.status.exit_ok()?;
-    transaction.extend(schema_res.stdout);
-
-    // Export statements for each table
     for handle in export_handles {
-        let export_res = handle?.await?;
-        export_res.status.exit_ok()?;
-        transaction.extend(export_res.stdout);
+        handle.await??;
     }
-    transaction.extend("COMMIT;".as_bytes());
-    let transaction_str = std::str::from_utf8(&transaction)?;
-
-    let conn = db.get().await?;
-    info!(
-        "sending {} conversion from {}",
-        human_bytes(transaction.len() as f64),
-        mdb_in.display()
-    );
-    conn.batch_execute(transaction_str).await?;
-    info!("finished converting `{}`", mdb_in.display(),);
+    info!("`{}`->SQL - DONE", mdb_in.display(),);
     Ok(())
 }
 
@@ -230,6 +235,10 @@ async fn main() -> Result<()> {
         while let Some(res) = results.next().await {
             res??;
         }
+        let conn = pool.get().await?;
+        warn!("fully vacuuming and analyzing database - this will take a while");
+        conn.batch_execute("VACUUM(FULL, ANALYZE, VERBOSE);")
+            .await?;
     } else {
         warn!(
             "`{}` already exists! continuing to conversion",
