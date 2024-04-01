@@ -174,7 +174,7 @@ async fn convert_mdb(mdb_in: PathBuf, db: Pool) -> Result<()> {
                 let sql = std::str::from_utf8(&raw_export)?;
                 let conn = db.get().await?;
                 conn.batch_execute(sql).await?;
-                debug!("`{}` / `{}` --> SQL", filename, table);
+                debug!("`{}` / `{}`->SQL", filename, table);
                 drop(conn);
                 anyhow::Ok(())
             })
