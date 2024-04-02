@@ -78,6 +78,7 @@ def process_mdb(f: Path, dst: Path) -> None:
         )
     except subprocess.CalledProcessError as e:
         logger.error(f"Error while subprocess was called! {e}")
+        raise
 
     # It's better to explicitly control error flow because we can run specific code for this error if needed rather
     # Than using a broad check of return code. We can also see exactly what went wrong instead of just knowing the command failed
@@ -95,6 +96,7 @@ def process_mdb(f: Path, dst: Path) -> None:
         )
     except subprocess.CalledProcessError as e:
         logger.error(f"Error while subprocess was called! {e}")
+        raise
 
     # Read above to know why
     #proc.check_returncode()
@@ -122,6 +124,7 @@ def process_mdb(f: Path, dst: Path) -> None:
             proc.check_returncode()
         except subprocess.CalledProcessError as e:
             logger.error(f"Error while subprocess was called! {e}")
+            raise
         cmds.append(proc.stdout)  # Insert data for each table
     cmds.append("COMMIT;")
     logger.debug(f"generated transaction for {f} to {dst}")
