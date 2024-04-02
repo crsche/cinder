@@ -103,22 +103,25 @@ def process_mdb(f: Path, dst: Path) -> None:
     cmds.append(proc.stdout)  # Create table commands
 
     for table in tables:
-        proc = subprocess.run(
-            [
-                "mdb-export",
-                "-H",
-                "-D",
-                "%Y-%m-%d %H:%M:%S",
-                "-I",
-                "sqlite",
-                f,
-                table,
-            ],
-            capture_output=True,
-            check=True,
-            text=True,
-        )
-        proc.check_returncode()
+        try:
+            proc = subprocess.run(
+                [
+                    "mdb-export",
+                    "-H",
+                    "-D",
+                    "%Y-%m-%d %H:%M:%S",
+                    "-I",
+                    "sqlite",
+                    f,
+                    table,
+                ],
+                capture_output=True,
+                check=True,
+                text=True,
+            )
+            proc.check_returncode()
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error while subprocess was called! {e}")
         cmds.append(proc.stdout)  # Insert data for each table
     cmds.append("COMMIT;")
     logger.debug(f"generated transaction for {f} to {dst}")
