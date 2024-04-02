@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 from stream_unzip import async_stream_unzip
 import sys
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 
 # import subprocess
 from shutil import which
@@ -176,7 +176,7 @@ async def main() -> None:
         logger.error(f"no .accdb files found in `{mdb_output}`")
         sys.exit(1)
     processed_output.mkdir(exist_ok=True, parents=True)
-    with ThreadPoolExecutor() as pool:
+    with ProcessPoolExecutor() as pool:
         for f in mdbs:
             pool.submit(process_mdb, f, processed_output.joinpath(f.stem + ".sqlite3"))
         pool.shutdown(wait=True)
