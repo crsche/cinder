@@ -72,17 +72,33 @@ async def download_mdb(
 
 def process_mdb(f: Path, dst: Path) -> None:
     logger.debug(f"processing {f} to {dst}")
-    proc = subprocess.run(
-        ["mdb-tables", "-1", f], capture_output=True, check=True, text=True
-    )
-    proc.check_returncode()  # Errors on nonzero exit code
+    try:
+        proc = subprocess.run(
+            ["mdb-tables", "-1", f], capture_output=True, check=True, text=True
+        )
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error while subprocess was called! {e}")
+
+    # It's better to explicitly control error flow because we can run specific code for this error if needed rather
+    # Than using a broad check of return code. We can also see exactly what went wrong instead of just knowing the command failed
+    # This is important because multiple factors can affect an error code
+    # Not only that but also logger can run specific code on the error
+    
+    # proc.check_returncode()  # Errors on nonzero exit code
+    
     tables = proc.stdout.splitlines()
 
     # Create the tables in the new sqlite3 database
-    proc = subprocess.run(
-        ["mdb-schema", f, "sqlite"], text=True, check=True, capture_output=True
-    )
-    proc.check_returncode()
+    try:
+        proc = subprocess.run(
+            ["mdb-schema", f, "sqlite"], text=True, check=True, capture_output=True
+        )
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error while subprocess was called! {e}")
+
+    # Read above to know why
+    #proc.check_returncode()
+    
     cmds = ["BEGIN;"]
     cmds.append(proc.stdout)  # Create table commands
 
