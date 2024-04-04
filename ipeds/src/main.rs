@@ -42,16 +42,28 @@ lazy_static! {
 #[derive(Debug, Parser)]
 struct Args {
     #[clap(short, long, default_value = "postgres://localhost")]
-    pg:          String,
-    #[clap(short, long, default_value = "cinder")]
-    dbname:      String,
-    #[clap(short, long, default_value = "32")]
-    concurrency: usize,
+    /// URI of Postgres database to insert the IPEDS data (should include the
+    /// database name)
+    pg:            String,
+    #[clap(short, long, default_value = "4")]
+    /// Number of IPEDS yearly datasets to download and process in parallel
+    concurrency:   usize,
     #[clap(short, long, default_value = "out/rust-raw/")]
-    out:         PathBuf,
+    /// Directory to store the raw IPEDS data
+    out:           PathBuf,
+    #[clap(short, long, default_value = "false")]
+    /// Drop all existing IPEDS tables in the database before inserting the new
+    /// ones
+    drop_existing: bool,
 }
 
-async fn get_mdb_convert(url: Url, out_dir: PathBuf, db: Pool, client: Client) -> Result<()> {
+async fn get_mdb_convert(
+    url: Url,
+    out_dir: PathBuf,
+    db: Pool,
+    drop_existing: bool,
+    client: Client,
+) -> Result<()> {
     // TODO: Make the path conversion/sanatization less cluttered
     let name = url
         .path_segments()
@@ -102,7 +114,11 @@ async fn get_mdb_convert(url: Url, out_dir: PathBuf, db: Pool, client: Client) -
                     if convert_handle.is_none() {
                         // Immediately begin converting the MDB file to SQL while still decoding the
                         // rest of the archrive
-                        convert_handle = Some(tokio::spawn(convert_mdb(filepath, db.clone())));
+                        convert_handle = Some(tokio::spawn(convert_mdb(
+                            filepath,
+                            db.clone(),
+                            drop_existing,
+                        )));
                     } else {
                         bail!("`{}`: multiple MDB files found", url.as_ref());
                     }
@@ -129,15 +145,16 @@ fn check_tools(tools: &[&str]) -> Result<()> {
     Ok(())
 }
 
-async fn convert_mdb(mdb_in: PathBuf, db: Pool) -> Result<()> {
+async fn convert_mdb(mdb_in: PathBuf, db: Pool, drop_existing: bool) -> Result<()> {
     let filename = mdb_in.file_name().unwrap().to_str().unwrap().to_string();
     info!("`{}`->SQL - START", filename);
     // Get schema with mdb-schema
     let mut get_schema = Command::new("mdb-schema");
-    get_schema
-        .args(&["--drop-table", "--no-relations"])
-        .arg(&mdb_in)
-        .arg("postgres");
+    get_schema.arg("--no-relations");
+    if drop_existing {
+        get_schema.arg("--drop-tables");
+    }
+    get_schema.arg(&mdb_in).arg("postgres");
     let raw_schema = get_schema.output().await?.stdout;
     let schema_sql = std::str::from_utf8(&raw_schema)?;
     let conn = db.get().await?;
@@ -212,13 +229,15 @@ async fn main() -> Result<()> {
         let poolcfg = PoolConfig::new(args.concurrency);
         let mut cfg = Config::new();
         cfg.pool = Some(poolcfg);
-        cfg.dbname = Some("cinder".to_string());
+        cfg.url = Some(args.pg);
         cfg.manager = Some(ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         });
         let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
 
-        warn!("THIS WILL DROP ALL TABLES IN THE DATABASE");
+        if args.drop_existing {
+            warn!("THIS WILL DROP ALL TABLES IN THE DATABASE");
+        }
 
         let mut results = stream::iter(html.select(&SEL_MDB_LINK).map(|el| {
             let href = el.value().attr("href").unwrap().to_owned();
@@ -227,7 +246,7 @@ async fn main() -> Result<()> {
             let out = args.out.clone();
             tokio::spawn(async move {
                 let url = IPEDS.join(&href)?;
-                get_mdb_convert(url, out, pool, client).await
+                get_mdb_convert(url, out, pool, args.drop_existing, client).await
             })
         }))
         .buffer_unordered(args.concurrency);
