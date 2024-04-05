@@ -4,14 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+tracing = { version = "0.1.40" }
 anyhow = "1.0.81"
-async_zip = { version = "0.0.16", features = ["full"] }
+async_zip = { version = "0.0.17", features = ["full"] }
 clap = { version = "4.5.4", features = [
   "derive",
   "unstable-styles",
   "unicode",
 ] }
-deadpool-postgres = "0.12.1"
+deadpool-postgres = "0.13.0"
 futures = "0.3.30"
 html5ever = "0.27.0"
 human_bytes = { version = "0.4.3", features = [
@@ -32,12 +33,10 @@ reqwest = { version = "0.12.2", features = [
 scraper = "0.19.0"
 tokio = { version = "1.37.0", features = ["full", "tracing"] }
 tokio-postgres = { version = "0.7.10", features = ["array-impls"] }
-tokio-util = { version = "0.7.10", features = ["io"] }
-tracing = { version = "0.1.40", features = ["release_max_level_debug"] }
-tracing-subscriber = "0.3.18"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 which = "6.0.1"
 
 [profile.release]
 codegen-units = 1
-# lto = "fat"
+lto = "fat"
 strip = false

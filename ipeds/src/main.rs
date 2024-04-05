@@ -2,6 +2,7 @@
 #[macro_use]
 extern crate tracing;
 use std::{
+    io::{Error, ErrorKind},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,24 +12,25 @@ use async_zip::base::read::stream::ZipFileReader;
 use clap::Parser;
 use deadpool_postgres::{Config, ManagerConfig, Pool, PoolConfig, RecyclingMethod, Runtime};
 use futures::{
-    io::{Error, ErrorKind},
     stream::{self, TryStreamExt},
-    StreamExt,
+    AsyncReadExt, StreamExt,
 };
 use human_bytes::human_bytes;
 use lazy_static::lazy_static;
 use reqwest::{Client, ClientBuilder, Url};
 use scraper::{Html, Selector};
 use tokio::{
-    fs::OpenOptions,
-    io::{self, BufReader as TokioBufReader},
+    fs::{create_dir_all, OpenOptions},
+    io::{AsyncWriteExt, BufWriter as TokioBufWriter},
     process::Command,
 };
 use tokio_postgres::NoTls;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tracing_subscriber::EnvFilter;
 use which::which;
 
 const REQUIRED_TOOLS: [&str; 3] = ["mdb-tables", "mdb-export", "mdb-schema"];
+const COPY_BUF_SIZE: usize = 1024 * 256;
+// const COMMAND: &'static str = "mdb-export -H -Q -D %Y-%m-%d %H:%M:%S {} {}";
 
 lazy_static! {
     static ref NCES: Url = Url::parse("https://nces.ed.gov").unwrap();
@@ -37,6 +39,7 @@ lazy_static! {
         .unwrap();
     static ref SEL_MDB_LINK: Selector =
         Selector::parse("table.ipeds-table a[href$='.zip']").unwrap();
+    static ref MDB_EXPORT: String = which("mdb-export").unwrap().to_str().unwrap().to_owned();
 }
 
 #[derive(Debug, Parser)]
@@ -48,7 +51,7 @@ struct Args {
     #[clap(short, long, default_value = "4")]
     /// Number of IPEDS yearly datasets to download and process in parallel
     concurrency:   usize,
-    #[clap(short, long, default_value = "out/rust-raw/")]
+    #[clap(short, long, default_value = "out/")]
     /// Directory to store the raw IPEDS data
     out:           PathBuf,
     #[clap(short, long, default_value = "false")]
@@ -59,7 +62,7 @@ struct Args {
 
 async fn get_mdb_convert(
     url: Url,
-    out_dir: PathBuf,
+    out_dir: Arc<PathBuf>,
     db: Pool,
     drop_existing: bool,
     client: Client,
@@ -67,10 +70,10 @@ async fn get_mdb_convert(
     // TODO: Make the path conversion/sanatization less cluttered
     let name = url
         .path_segments()
-        .ok_or(anyhow!("`{}`: no path segments found", url.as_ref()))?
+        .ok_or(anyhow!("'{}': no path segments found", &url))?
         .last()
-        .ok_or(anyhow!("`{}`: no last path segment found", url.as_ref()))?;
-    info!("`{}`->`{}` - START", name, out_dir.display());
+        .ok_or(anyhow!("'{}': no last path segment found", &url))?;
+    info!("UNZIP: START '{}' -> '{}'", name, out_dir.display());
     let resp = client.get(url.clone()).send().await?.error_for_status()?;
 
     let stream = resp
@@ -87,25 +90,40 @@ async fn get_mdb_convert(
 
             let raw_name = rdr.entry().filename().as_str()?.to_owned(); // Raw name of the file according to the zip archive
             let raw_path = Path::new(&raw_name);
-            if raw_path.extension().is_some() {
+            if let Some(ext) = raw_path.extension() {
                 // Nested folders are not supported
                 let filename = raw_path
                     .file_name()
-                    .ok_or(anyhow!("`{}`: no file name found", raw_name))?;
-                let filepath = out_dir.join(filename);
+                    .ok_or(anyhow!("'{}': no file name found", raw_name))?;
+                let type_out_dir = out_dir.join(ext);
+                if !type_out_dir.exists() {
+                    warn!("CREATE: '{}'", type_out_dir.display());
+                    create_dir_all(&type_out_dir).await?;
+                }
+                let filepath = type_out_dir.join(filename);
                 let f = OpenOptions::new()
-                    // .truncate(true)
                     .write(true)
-                    .create_new(true)
+                    .create(true)
+                    .truncate(true)
                     .open(&filepath)
                     .await?;
-                let mut wrtr = TokioBufReader::new(f);
-                let mut compat_rdr = rdr.compat();
-                let bytes = io::copy(&mut compat_rdr, &mut wrtr).await?;
+                let mut wrtr = TokioBufWriter::new(f);
+
+                let mut total_bytes = 0;
+                let mut buf = [0u8; COPY_BUF_SIZE];
+                loop {
+                    let n = rdr.read(&mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    total_bytes += n;
+                    wrtr.write_all(&buf[..n]).await?;
+                }
+                wrtr.flush().await?;
                 info!(
-                    "`{}` - {} bytes written",
-                    filename.to_string_lossy(),
-                    human_bytes(bytes as f64),
+                    "WRITE: '{}'({})",
+                    filepath.display(),
+                    human_bytes(total_bytes as f64),
                 );
 
                 if let Some(ext) = filepath.extension()
@@ -116,11 +134,12 @@ async fn get_mdb_convert(
                         // rest of the archrive
                         convert_handle = Some(tokio::spawn(convert_mdb(
                             filepath,
+                            out_dir.clone(),
                             db.clone(),
                             drop_existing,
                         )));
                     } else {
-                        bail!("`{}`: multiple MDB files found", url.as_ref());
+                        bail!("'{}': multiple MDB files found", url.as_ref());
                     }
                 }
             }
@@ -129,7 +148,7 @@ async fn get_mdb_convert(
             break;
         }
     }
-    info!("`{}`->`{}` - DONE", name, out_dir.display());
+    info!("UNZIP: FINISH '{}' -> '{}'", name, out_dir.display());
     if let Some(handle) = convert_handle {
         handle.await??;
     }
@@ -139,60 +158,95 @@ async fn get_mdb_convert(
 fn check_tools(tools: &[&str]) -> Result<()> {
     for tool in tools {
         if which(tool).is_err() {
-            bail!("`{}` not found in PATH", tool);
+            bail!("'{}' not found in $PATH", tool);
         }
     }
     Ok(())
 }
 
-async fn convert_mdb(mdb_in: PathBuf, db: Pool, drop_existing: bool) -> Result<()> {
-    let filename = mdb_in.file_name().unwrap().to_str().unwrap().to_string();
-    info!("`{}`->SQL - START", filename);
-    // Get schema with mdb-schema
-    let mut get_schema = Command::new("mdb-schema");
-    get_schema.arg("--no-relations");
-    if drop_existing {
-        get_schema.arg("--drop-tables");
+async fn convert_mdb(
+    mdb_in: PathBuf,
+    out_dir: Arc<PathBuf>,
+    db: Pool,
+    drop_existing: bool,
+) -> Result<()> {
+    let mdbname = mdb_in
+        .file_stem()
+        .ok_or(anyhow!("'{}': no file stem found", mdb_in.display()))?
+        .to_str()
+        .ok_or(anyhow!("'{}': invalid path", mdb_in.display()))?
+        .to_owned();
+    info!("CONVERT: START '{}' -> SQL", mdbname);
+    let schema_dir = out_dir.join("schema/");
+    if !schema_dir.exists() {
+        warn!("CREATE: '{}'", schema_dir.display());
+        create_dir_all(schema_dir.as_path()).await?;
     }
-    get_schema.arg(&mdb_in).arg("postgres");
-    let raw_schema = get_schema.output().await?.stdout;
+    // Get schema with mdb-schema
+    let mut cmd = Command::new("mdb-schema");
+    cmd.arg("--no-relations");
+    if drop_existing {
+        cmd.arg("--drop-table");
+    }
+    cmd.arg(&mdb_in).arg("postgres");
+    trace!("{:?}", cmd);
+    let raw_schema = cmd.output().await?.stdout;
     let schema_sql = std::str::from_utf8(&raw_schema)?;
+
+    let schema_path = schema_dir.join(&mdbname).with_extension("sql");
+    let f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&schema_path)
+        .await?;
+    let mut wrtr = TokioBufWriter::new(f);
+    wrtr.write_all(schema_sql.as_bytes()).await?;
+    wrtr.flush().await?;
+
+    info!(
+        "WRITE: '{}'({})",
+        schema_path.display(),
+        human_bytes(schema_sql.len() as f64)
+    );
+
     let conn = db.get().await?;
     conn.batch_execute(schema_sql).await?;
     drop(conn);
+    info!("CONVERT: SCHEMA {}", mdbname);
 
     // Get tables with mdb-tables. TODO: Make this less verbose?
-    let mut get_tables = Command::new("mdb-tables");
-    get_tables.arg("-1").arg(&mdb_in);
-    let raw_tables = get_tables.output().await?.stdout.clone();
+    let mut cmd = Command::new("mdb-tables");
+    cmd.arg("-1").arg(&mdb_in);
+    trace!("{:?}", cmd);
+    let raw_tables = cmd.output().await?.stdout.clone();
     let tables = std::str::from_utf8(&raw_tables)?;
 
     // Spawn tasks for exporting the tables with mdb-export
     let mdb_in = Arc::new(mdb_in);
-    let filename = Arc::new(filename);
+    let mdbname = Arc::new(mdbname);
     let export_handles = tables
         .lines()
         .map(|table| {
-            // Export each table with mdbtools (doesn't support exporting everything)
             let db = db.clone();
             let mdb_in = mdb_in.clone();
-            let filename = filename.clone();
+            let mdbname = mdbname.clone();
             let table = table.to_owned();
             tokio::spawn(async move {
-                let mut export = Command::new("mdb-export");
-                export
-                    .arg("-H")
-                    .arg("-D")
-                    .arg("%Y-%m-%d %H:%M:%S")
-                    .args(&["-I", "postgres"])
-                    .arg(mdb_in.as_ref()) // Pass the reference to OsStr
-                    .arg(&table);
-                let raw_export = export.output().await?.stdout;
-                let sql = std::str::from_utf8(&raw_export)?;
+                let cmd = format!(
+                    "{} -H {} {}", // -H: no header row
+                    MDB_EXPORT.as_str(),
+                    mdb_in
+                        .to_str()
+                        .ok_or(anyhow!("'{}': invalid path", mdb_in.display()))?,
+                    table
+                );
+                let sql = format!("COPY {} FROM PROGRAM '{}' (FORMAT csv);", table, cmd);
                 let conn = db.get().await?;
-                conn.batch_execute(sql).await?;
-                debug!("`{}` / `{}`->SQL", filename, table);
+                trace!("EXEC: '{}'", sql);
+                conn.batch_execute(&sql).await?;
                 drop(conn);
+                debug!("COPY: {}/{} -> SQL", mdbname, table);
                 anyhow::Ok(())
             })
         })
@@ -200,50 +254,56 @@ async fn convert_mdb(mdb_in: PathBuf, db: Pool, drop_existing: bool) -> Result<(
     for handle in export_handles {
         handle.await??;
     }
-    info!("`{}`->SQL - DONE", mdb_in.display(),);
+    info!("CONVERT: FINISHED {} -> SQL", mdbname);
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
+    tracing_subscriber::fmt::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+    let mut args = Args::parse();
     let client = ClientBuilder::new()
-        // .http3_prior_knowledge() Reqwest support for HTTP3 paused
-        .use_rustls_tls()
-        .https_only(true)
-        .gzip(true)
-        .deflate(true)
+        // .http3_prior_knowledge() Reqwest support for HTTP3 p
         .brotli(true)
+        .deflate(true)
+        .gzip(true)
+        .https_only(true)
         .build()?;
-
-    let html_str = client.get(IPEDS.clone()).send().await?.text().await?;
-    let html = Html::parse_document(&html_str);
 
     if !args.out.exists() {
         check_tools(&REQUIRED_TOOLS)?;
 
-        warn!("creating `{}`", args.out.display());
-        std::fs::create_dir_all(args.out.as_path())?;
+        warn!("CREATE: '{}'", args.out.display());
+        create_dir_all(args.out.as_path()).await?;
+        args.out = args.out.canonicalize()?;
 
         let poolcfg = PoolConfig::new(args.concurrency);
         let mut cfg = Config::new();
         cfg.pool = Some(poolcfg);
-        cfg.url = Some(args.pg);
+        cfg.url = Some(args.pg.clone());
         cfg.manager = Some(ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         });
         let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
 
         if args.drop_existing {
-            warn!("THIS WILL DROP ALL TABLES IN THE DATABASE");
+            error!(
+                "!!! THIS WILL DROP EXISTING IPEDS TABLES IN '{}' !!!",
+                args.pg
+            );
         }
 
+        let raw_html = client.get(IPEDS.clone()).send().await?.text().await?;
+        let html = Html::parse_document(&raw_html);
+
+        let out = Arc::new(args.out);
         let mut results = stream::iter(html.select(&SEL_MDB_LINK).map(|el| {
             let href = el.value().attr("href").unwrap().to_owned();
             let pool = pool.clone();
             let client = client.clone();
-            let out = args.out.clone();
+            let out = out.clone();
             tokio::spawn(async move {
                 let url = IPEDS.join(&href)?;
                 get_mdb_convert(url, out, pool, args.drop_existing, client).await
@@ -260,7 +320,7 @@ async fn main() -> Result<()> {
             .await?;
     } else {
         warn!(
-            "`{}` already exists! continuing to conversion",
+            "{} already exists! continuing to conversion",
             args.out.display()
         );
         unimplemented!("a separate way to convert the mdb files");
