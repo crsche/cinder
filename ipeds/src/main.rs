@@ -54,10 +54,13 @@ struct Args {
     #[clap(short, long, default_value = "out/")]
     /// Directory to store the raw IPEDS data
     out:           PathBuf,
-    #[clap(short, long, default_value = "false")]
+    #[clap(long, default_value = "false")]
     /// Drop all existing IPEDS tables in the database before inserting the new
     /// ones
     drop_existing: bool,
+    #[clap(long, default_value = "false")]
+    /// Vacuum and analyze the database after inserting the IPEDS data
+    clean:         bool,
 }
 
 async fn get_mdb_convert(
@@ -314,10 +317,11 @@ async fn main() -> Result<()> {
         while let Some(res) = results.next().await {
             res??;
         }
-        let conn = pool.get().await?;
-        warn!("fully vacuuming and analyzing database - this will take a while");
-        conn.batch_execute("VACUUM(FULL, ANALYZE, VERBOSE);")
-            .await?;
+        if args.clean {
+            let conn = pool.get().await?;
+            warn!("EXEC: 'VACUUM(FULL, ANALYZE);' - THIS MAY TAKE A WHILE!");
+            conn.batch_execute("VACUUM(FULL, ANALYZE);").await?;
+        }
     } else {
         warn!(
             "{} already exists! continuing to conversion",
