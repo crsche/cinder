@@ -44,23 +44,23 @@ lazy_static! {
 
 #[derive(Debug, Parser)]
 struct Args {
-    #[clap(short, long, default_value = "postgres://localhost")]
+    #[clap(short, long, default_value = "postgres://localhost/ipeds")]
     /// URI of Postgres database to insert the IPEDS data (should include the
     /// database name)
     pg:            String,
-    #[clap(short, long, default_value = "4")]
+    #[clap(short, long, default_value = "8")]
     /// Number of IPEDS yearly datasets to download and process in parallel
     concurrency:   usize,
     #[clap(short, long, default_value = "out/")]
     /// Directory to store the raw IPEDS data
     out:           PathBuf,
-    #[clap(long, default_value = "false")]
+    #[clap(long)]
     /// Drop all existing IPEDS tables in the database before inserting the new
     /// ones
     drop_existing: bool,
-    #[clap(long, default_value = "false")]
+    #[clap(long)]
     /// Vacuum and analyze the database after inserting the IPEDS data
-    clean:         bool,
+    optimize:      bool,
 }
 
 async fn get_mdb_convert(
@@ -216,7 +216,7 @@ async fn convert_mdb(
     let conn = db.get().await?;
     conn.batch_execute(schema_sql).await?;
     drop(conn);
-    info!("CONVERT: SCHEMA {}", mdbname);
+    info!("CONVERT: SCHEMA '{}' -> SQL", mdbname);
 
     // Get tables with mdb-tables. TODO: Make this less verbose?
     let mut cmd = Command::new("mdb-tables");
@@ -249,7 +249,7 @@ async fn convert_mdb(
                 trace!("EXEC: '{}'", sql);
                 conn.batch_execute(&sql).await?;
                 drop(conn);
-                debug!("COPY: {}/{} -> SQL", mdbname, table);
+                debug!("COPY: {}.{} -> SQL", mdbname, table);
                 anyhow::Ok(())
             })
         })
@@ -317,7 +317,7 @@ async fn main() -> Result<()> {
         while let Some(res) = results.next().await {
             res??;
         }
-        if args.clean {
+        if args.optimize {
             let conn = pool.get().await?;
             warn!("EXEC: 'VACUUM(FULL, ANALYZE);' - THIS MAY TAKE A WHILE!");
             conn.batch_execute("VACUUM(FULL, ANALYZE);").await?;
