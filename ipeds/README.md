@@ -16,11 +16,11 @@ options:
 
 ## Rust
 
-The rust code in [src/](./src/) gathers all of the IPEDS data from all possible years (see the [IPEDS Access Database homepage](https://nces.ed.gov/ipeds/use-the-data/download-access-database)) into a single postgres database. It also outputs the raw Access DBs and associated documenation at the directory specified by `--out` (default is `out/rust-raw/`).
+The rust code in [src/](./src/) gathers all of the IPEDS data from all possible years (see the [IPEDS Access Database homepage](https://nces.ed.gov/ipeds/use-the-data/download-access-database)) into a single postgres database. It also outputs the associated documentation (`.docx` and `.xlsx`) to the directory specified by `--out` (default is `out/`).
 
 ### NOTE
 
-You might have to give postgres access to `/tmp` so it has permission to import the `accdb` files. You can do this by setting `PrivateTmp=true` in `postgresql.service` (`/var/lib/systemd/system/postgresql.service`).
+You might have to give postgres access to `/tmp` so it has permission to import the `accdb` files. You can do this by setting `PrivateTmp=false` in `postgresql.service` (`/var/lib/systemd/system/postgresql.service`).
 
 ### Usage
 
