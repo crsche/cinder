@@ -3,9 +3,7 @@
 extern crate tracing;
 use std::{
     io::{Error, ErrorKind},
-    ops::Deref,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
 };
 
@@ -15,7 +13,7 @@ use clap::Parser;
 use deadpool_postgres::{Config, ManagerConfig, Pool, PoolConfig, RecyclingMethod, Runtime};
 use futures::{
     stream::{self, TryStreamExt},
-    AsyncReadExt, StreamExt,
+    StreamExt,
 };
 use human_bytes::human_bytes;
 use lazy_static::lazy_static;
@@ -46,7 +44,6 @@ lazy_static! {
         which("mdb-tables").expect("'mdb-tables' command not in $PATH");
     static ref MDB_SCHEMA: PathBuf =
         which("mdb-schema").expect("'mdb-schema' command not in $PATH");
-    static ref TMP_DIR: TempDir = tempdir().expect("failed to create temporary directory");
 }
 
 #[derive(Debug, Parser)]
@@ -72,7 +69,8 @@ struct Args {
 
 async fn get_mdb_convert(
     url: Url,
-    out_dir: Arc<PathBuf>,
+    docs_out: Arc<PathBuf>,
+    tmp: Arc<TempDir>,
     db: Pool,
     drop_existing: bool,
     client: Client,
@@ -83,7 +81,7 @@ async fn get_mdb_convert(
         .ok_or(anyhow!("'{}': no path segments found", &url))?
         .last()
         .ok_or(anyhow!("'{}': no last path segment found", &url))?;
-    info!("UNZIP: START '{}' -> '{}'", name, out_dir.display());
+    info!("UNZIP: START '{}' -> '{}'", name, docs_out.display());
     let resp = client.get(url.clone()).send().await?.error_for_status()?;
 
     let stream = resp
@@ -109,14 +107,14 @@ async fn get_mdb_convert(
                 let is_mdb = ext == "accdb";
 
                 let filepath = if !is_mdb {
-                    let type_out_dir = out_dir.join(ext);
-                    if !type_out_dir.exists() {
-                        warn!("CREATE: '{}'", type_out_dir.display());
-                        create_dir_all(&type_out_dir).await?;
+                    let type_docs_out = docs_out.join(ext);
+                    if !type_docs_out.exists() {
+                        warn!("CREATE: '{}'", type_docs_out.display());
+                        create_dir_all(&type_docs_out).await?;
                     }
-                    type_out_dir.join(filename)
+                    type_docs_out.join(filename)
                 } else {
-                    TMP_DIR.path().join(filename)
+                    tmp.path().join(filename)
                 };
 
                 let f = OpenOptions::new()
@@ -141,7 +139,7 @@ async fn get_mdb_convert(
                         // rest of the archrive
                         convert_handle = Some(tokio::spawn(convert_mdb(
                             filepath,
-                            out_dir.clone(),
+                            docs_out.clone(),
                             db.clone(),
                             drop_existing,
                         )));
@@ -155,7 +153,7 @@ async fn get_mdb_convert(
             break;
         }
     }
-    info!("UNZIP: FINISH '{}' -> '{}'", name, out_dir.display());
+    info!("UNZIP: FINISH '{}' -> '{}'", name, docs_out.display());
     if let Some(handle) = convert_handle {
         handle.await??;
     }
@@ -164,7 +162,7 @@ async fn get_mdb_convert(
 
 async fn convert_mdb(
     mdb_in: PathBuf,
-    out_dir: Arc<PathBuf>,
+    docs_out: Arc<PathBuf>,
     db: Pool,
     drop_existing: bool,
 ) -> Result<()> {
@@ -175,7 +173,7 @@ async fn convert_mdb(
         .ok_or(anyhow!("'{}': invalid path", mdb_in.display()))?
         .to_owned();
     info!("CONVERT: START '{}' -> SQL", mdbname);
-    let schema_dir = out_dir.join("schema/");
+    let schema_dir = docs_out.join("schema/");
     if !schema_dir.exists() {
         warn!("CREATE: '{}'", schema_dir.display());
         create_dir_all(schema_dir.as_path()).await?;
@@ -294,15 +292,17 @@ async fn main() -> Result<()> {
         let raw_html = client.get(IPEDS.clone()).send().await?.text().await?;
         let html = Html::parse_document(&raw_html);
 
+        let tmp = Arc::new(tempdir()?); // Closes temp dir when dropped!
         let out = Arc::new(args.out);
         let mut results = stream::iter(html.select(&SEL_MDB_LINK).map(|el| {
             let href = el.value().attr("href").unwrap().to_owned();
             let pool = pool.clone();
             let client = client.clone();
             let out = out.clone();
+            let tmp = tmp.clone();
             tokio::spawn(async move {
                 let url = IPEDS.join(&href)?;
-                get_mdb_convert(url, out, pool, args.drop_existing, client).await
+                get_mdb_convert(url, out, tmp, pool, args.drop_existing, client).await
             })
         }))
         .buffer_unordered(args.concurrency);
