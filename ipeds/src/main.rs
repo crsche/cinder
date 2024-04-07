@@ -3,7 +3,9 @@
 extern crate tracing;
 use std::{
     io::{Error, ErrorKind},
+    ops::Deref,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
 };
 
@@ -19,18 +21,17 @@ use human_bytes::human_bytes;
 use lazy_static::lazy_static;
 use reqwest::{Client, ClientBuilder, Url};
 use scraper::{Html, Selector};
+use tempfile::{tempdir, TempDir};
 use tokio::{
     fs::{create_dir_all, OpenOptions},
-    io::{AsyncWriteExt, BufWriter as TokioBufWriter},
+    io,
+    io::{AsyncWriteExt, BufReader as TokioBufReader, BufWriter as TokioBufWriter},
     process::Command,
 };
 use tokio_postgres::NoTls;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing_subscriber::EnvFilter;
 use which::which;
-
-const REQUIRED_TOOLS: [&str; 3] = ["mdb-tables", "mdb-export", "mdb-schema"];
-const COPY_BUF_SIZE: usize = 1024 * 256;
-// const COMMAND: &'static str = "mdb-export -H -Q -D %Y-%m-%d %H:%M:%S {} {}";
 
 lazy_static! {
     static ref NCES: Url = Url::parse("https://nces.ed.gov").unwrap();
@@ -39,7 +40,13 @@ lazy_static! {
         .unwrap();
     static ref SEL_MDB_LINK: Selector =
         Selector::parse("table.ipeds-table a[href$='.zip']").unwrap();
-    static ref MDB_EXPORT: String = which("mdb-export").unwrap().to_str().unwrap().to_owned();
+    static ref MDB_EXPORT: PathBuf =
+        which("mdb-export").expect("'mdb-export' command not in $PATH");
+    static ref MDB_TABLES: PathBuf =
+        which("mdb-tables").expect("'mdb-tables' command not in $PATH");
+    static ref MDB_SCHEMA: PathBuf =
+        which("mdb-schema").expect("'mdb-schema' command not in $PATH");
+    static ref TMP_DIR: TempDir = tempdir().expect("failed to create temporary directory");
 }
 
 #[derive(Debug, Parser)]
@@ -98,12 +105,20 @@ async fn get_mdb_convert(
                 let filename = raw_path
                     .file_name()
                     .ok_or(anyhow!("'{}': no file name found", raw_name))?;
-                let type_out_dir = out_dir.join(ext);
-                if !type_out_dir.exists() {
-                    warn!("CREATE: '{}'", type_out_dir.display());
-                    create_dir_all(&type_out_dir).await?;
-                }
-                let filepath = type_out_dir.join(filename);
+
+                let is_mdb = ext == "accdb";
+
+                let filepath = if !is_mdb {
+                    let type_out_dir = out_dir.join(ext);
+                    if !type_out_dir.exists() {
+                        warn!("CREATE: '{}'", type_out_dir.display());
+                        create_dir_all(&type_out_dir).await?;
+                    }
+                    type_out_dir.join(filename)
+                } else {
+                    TMP_DIR.path().join(filename)
+                };
+
                 let f = OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -111,27 +126,16 @@ async fn get_mdb_convert(
                     .open(&filepath)
                     .await?;
                 let mut wrtr = TokioBufWriter::new(f);
+                let mut rdr = TokioBufReader::new(rdr.compat());
+                let bytes = io::copy(&mut rdr, &mut wrtr).await?;
 
-                let mut total_bytes = 0;
-                let mut buf = [0u8; COPY_BUF_SIZE];
-                loop {
-                    let n = rdr.read(&mut buf).await?;
-                    if n == 0 {
-                        break;
-                    }
-                    total_bytes += n;
-                    wrtr.write_all(&buf[..n]).await?;
-                }
-                wrtr.flush().await?;
                 info!(
                     "WRITE: '{}'({})",
                     filepath.display(),
-                    human_bytes(total_bytes as f64),
+                    human_bytes(bytes as f64),
                 );
 
-                if let Some(ext) = filepath.extension()
-                    && ext == "accdb"
-                {
+                if is_mdb {
                     if convert_handle.is_none() {
                         // Immediately begin converting the MDB file to SQL while still decoding the
                         // rest of the archrive
@@ -158,15 +162,6 @@ async fn get_mdb_convert(
     Ok(())
 }
 
-fn check_tools(tools: &[&str]) -> Result<()> {
-    for tool in tools {
-        if which(tool).is_err() {
-            bail!("'{}' not found in $PATH", tool);
-        }
-    }
-    Ok(())
-}
-
 async fn convert_mdb(
     mdb_in: PathBuf,
     out_dir: Arc<PathBuf>,
@@ -186,7 +181,7 @@ async fn convert_mdb(
         create_dir_all(schema_dir.as_path()).await?;
     }
     // Get schema with mdb-schema
-    let mut cmd = Command::new("mdb-schema");
+    let mut cmd = Command::new(MDB_SCHEMA.as_path());
     cmd.arg("--no-relations");
     if drop_existing {
         cmd.arg("--drop-table");
@@ -219,7 +214,7 @@ async fn convert_mdb(
     info!("CONVERT: SCHEMA '{}' -> SQL", mdbname);
 
     // Get tables with mdb-tables. TODO: Make this less verbose?
-    let mut cmd = Command::new("mdb-tables");
+    let mut cmd = Command::new(MDB_TABLES.as_path());
     cmd.arg("-1").arg(&mdb_in);
     trace!("{:?}", cmd);
     let raw_tables = cmd.output().await?.stdout.clone();
@@ -238,10 +233,9 @@ async fn convert_mdb(
             tokio::spawn(async move {
                 let cmd = format!(
                     "{} -H {} {}", // -H: no header row
-                    MDB_EXPORT.as_str(),
-                    mdb_in
-                        .to_str()
-                        .ok_or(anyhow!("'{}': invalid path", mdb_in.display()))?,
+                    MDB_EXPORT.canonicalize()?.display(),
+                    mdb_in.display(),
+                    // .ok_or(anyhow!("'{}': invalid path", mdb_in.display()))?,
                     table
                 );
                 let sql = format!("COPY {} FROM PROGRAM '{}' (FORMAT csv);", table, cmd);
@@ -257,7 +251,7 @@ async fn convert_mdb(
     for handle in export_handles {
         handle.await??;
     }
-    info!("CONVERT: FINISHED {} -> SQL", mdbname);
+    info!("CONVERT: FINISHED '{}' -> SQL", mdbname);
     Ok(())
 }
 
@@ -276,13 +270,12 @@ async fn main() -> Result<()> {
         .build()?;
 
     if !args.out.exists() {
-        check_tools(&REQUIRED_TOOLS)?;
-
+        // args.out = args.out.canonicalize()?;
         warn!("CREATE: '{}'", args.out.display());
         create_dir_all(args.out.as_path()).await?;
         args.out = args.out.canonicalize()?;
 
-        let poolcfg = PoolConfig::new(args.concurrency);
+        let poolcfg = PoolConfig::default(); // We don't use args.concurrency here because
         let mut cfg = Config::new();
         cfg.pool = Some(poolcfg);
         cfg.url = Some(args.pg.clone());
